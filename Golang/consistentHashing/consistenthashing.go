@@ -1,0 +1,90 @@
+/*
+We are experiencing a memory leak in our Go application.
+The primary marker is a classic staircase pattern in our Grafana memory metrics. During a traffic spike,
+memory usage climbs significantly but never returns to the baseline after traffic drops.
+Over 48 hours, the Resident Set Size (RSS) steadily increases until Kubernetes triggers an OOMKilled (Exit Code 137) event.
+Think of yourself as a Senior Staff Engineer with an expertise in concurrency, memory management and profiling evaluating a junior Engineers code,
+can you analyse the following code and pinpoint what could be causing that memory leak.
+Analyse the following code, give a step by step plan to fix it and suggest tests to incorporate in CI in future to avoid such situation.
+*/
+package main
+
+import (
+	"crypto/sha1"
+	"encoding/binary"
+	"fmt"
+	"sort"
+	"sync"
+)
+
+type HashRing struct {
+	mu       sync.RWMutex
+	replicas int
+	keys     []uint32
+	hashMap  map[uint32]string
+}
+
+func NewHashRing(replicas int) *HashRing {
+	return &HashRing{
+		replicas: replicas,
+		hashMap:  make(map[uint32]string),
+	}
+}
+
+func (h *HashRing) hashKey(key string) uint32 {
+	sum := sha1.Sum([]byte(key))
+	return binary.BigEndian.Uint32(sum[:4])
+}
+
+func (h *HashRing) Add(nodes ...string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, node := range nodes {
+		for i := 0; i < h.replicas; i++ {
+			hash := h.hashKey(fmt.Sprintf("%s#%d", node, i))
+			h.keys = append(h.keys, hash)
+			h.hashMap[hash] = node
+		}
+	}
+	sort.Slice(h.keys, func(i, j int) bool { return h.keys[i] < h.keys[j] })
+}
+
+func (h *HashRing) Get(key string) string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if len(h.keys) == 0 {
+		return ""
+	}
+	hash := h.hashKey(key)
+	idx := sort.Search(len(h.keys), func(i int) bool {
+		return h.keys[i] >= hash
+	})
+	if idx == len(h.keys) {
+		idx = 0
+	}
+	return h.hashMap[h.keys[idx]]
+}
+
+func (h *HashRing) GetFirstResponse(keys []string) string {
+	ch := make(chan string)
+
+	for _, key := range keys {
+		go func(k string) {
+			node := h.Get(k)
+			ch <- node
+		}(key)
+	}
+
+	return <-ch
+}
+
+func main() {
+	ring := NewHashRing(3)
+	ring.Add("node-A", "node-B", "node-C")
+
+	for _, k := range []string{"user1", "user2", "user3"} {
+		fmt.Printf("%s -> %s\n", k, ring.Get(k))
+	}
+
+	fmt.Println("first:", ring.GetFirstResponse([]string{"a", "b", "c", "d"}))
+}
